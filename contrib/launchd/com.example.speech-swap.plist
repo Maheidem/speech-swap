@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for a launchd job of speech-swap.
+  1. Copy this file and change every value marked CHANGE.
+  2. Install it as a LaunchAgent (runs when the user logs in):
+       cp com.example.speech-swap.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.speech-swap.plist
+     Or install it as a LaunchDaemon (runs at boot; keep the UserName key):
+       sudo install -o root -g wheel -m 644 com.example.speech-swap.plist /Library/LaunchDaemons/
+       sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.speech-swap.plist
+  3. Stop it: launchctl bootout gui/$(id -u)/com.example.speech-swap
+     (daemon: sudo launchctl bootout system/com.example.speech-swap)
+  The hub stops its engines when launchd sends SIGTERM.
+  The engines run as children of the hub, so they use the same user.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.speech-swap</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/CHANGE/speech-swap/speech-swap</string>
+    <string>/Users/CHANGE/speech-swap/m1.toml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/CHANGE/speech-swap</string>
+  <!-- LaunchDaemon only: <key>UserName</key><string>CHANGE</string> -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/CHANGE</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <!-- One variable for each key_env of the config. Use long random values. -->
+    <key>SSW_KEY_VOICE</key>
+    <string>CHANGE</string>
+    <key>SSW_KEY_APP</key>
+    <string>CHANGE</string>
+    <key>SSW_KEY_BATCH</key>
+    <string>CHANGE</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardErrorPath</key>
+  <string>/Users/CHANGE/speech-swap/hub.log</string>
+  <key>StandardOutPath</key>
+  <string>/Users/CHANGE/speech-swap/hub.log</string>
+</dict>
+</plist>

@@ -99,17 +99,18 @@ pub fn merge(results: &[WindowResult]) -> (String, Vec<Word>) {
     (text, words)
 }
 
-/// Strips the marks around a token, as the aligner does.
-fn bare(token: &str) -> &str {
-    token.trim_matches(|c: char| !c.is_alphanumeric())
+/// The letters and digits of a token. The aligner drops all other marks,
+/// also inside a token ("3.8" becomes "38").
+fn key(token: &str) -> String {
+    token.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 /// The aligner drops the punctuation. This function gives the original
 /// tokens back (with their marks) when the tokens of the text match the
 /// words one to one. Otherwise it returns `None`.
 pub fn tokens_with_marks(text: &str, words: &[Word]) -> Option<Vec<String>> {
-    let tokens: Vec<&str> = text.split_whitespace().filter(|t| !bare(t).is_empty()).collect();
-    (tokens.len() == words.len() && tokens.iter().zip(words).all(|(t, w)| bare(t).eq_ignore_ascii_case(bare(&w.text)) || bare(t) == bare(&w.text)))
+    let tokens: Vec<&str> = text.split_whitespace().filter(|t| !key(t).is_empty()).collect();
+    (tokens.len() == words.len() && tokens.iter().zip(words).all(|(t, w)| key(t) == key(&w.text)))
         .then(|| tokens.into_iter().map(str::to_string).collect())
 }
 
@@ -292,6 +293,9 @@ mod tests {
         // A token that is only a mark has no word.
         let got = tokens_with_marks("Cancela - o timer, atual.", &words).unwrap();
         assert_eq!(got.len(), 4);
+        // The aligner drops marks inside a token too.
+        let nums = vec![word("122400", 0.0, 1.0), word("Segundo", 1.0, 2.0)];
+        assert_eq!(tokens_with_marks("122.400. Segundo,", &nums).unwrap(), ["122.400.", "Segundo,"]);
         // The counts differ: no result.
         assert!(tokens_with_marks("Cancela o timer", &words).is_none());
     }

@@ -455,8 +455,14 @@ mod tests {
         std::env::set_var("SSW_KEY_VOICE", "k0");
         std::env::set_var("SSW_KEY_APP", "k1");
         std::env::set_var("SSW_KEY_BATCH", "k2");
-        let cfg = Config::parse(text).unwrap();
-        assert_eq!(cfg.model_ids(), ["Qwen3-ASR-1.7B", "parakeet-tdt-0.6b-v3"]);
+        // The token file of the example does not exist on a test machine.
+        let text: String = text.lines().filter(|l| !l.starts_with("token_file")).collect::<Vec<_>>().join("\n");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.model_ids(), ["Qwen3-ASR-1.7B", "parakeet-tdt-0.6b-v3", "Qwen3-ForcedAligner-0.6B", "qwen3-asr+align"]);
+        assert_eq!(cfg.resolve("qwen3-asr+align"), Some(Route::Pipeline { stt: 0, align: 2, id: "qwen3-asr+align".into() }));
+        assert_eq!(cfg.implicit_pipeline(0), Some((0, 2)));
+        assert_eq!(cfg.wyoming.len(), 2);
+        assert_eq!(cfg.engines[2].cost_mb, 3400);
         assert_eq!(cfg.engine_index("whisper-1"), Some(0));
         assert_eq!(cfg.engine_index("PARAKEET"), Some(1));
         assert_eq!(cfg.engines[0].cost_mb, 2500);

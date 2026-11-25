@@ -10,32 +10,36 @@ The design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Status
 
-**M1 (MVP) works on an 8 GB M1 MacBook Air.**
-It runs as a normal user process. It is not a launchd service yet, and only the speech-to-text routes exist.
+**M2 works on an 8 GB M1 MacBook Air.**
+It runs as a normal user process. It is not a launchd service yet.
 
 Implemented:
 
-- `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /health`, `GET /running`, `GET /metrics` (Prometheus text).
+- Routes: `POST /v1/audio/transcriptions`, `POST /v1/audio/alignments`, `POST /align` (the legacy JSON route of the subtitle client), `GET /v1/models`, `GET /health`, `GET /running`, `GET /metrics` (Prometheus text).
 - Bearer keys from the config. Each key has a priority class: 0 voice, 1 interactive, 2 batch. `open = true` turns authentication off for tests.
 - Input normalization, so clients need no change:
   - Any audio format (WAV, OGG/Opus, MP3, M4A, FLAC, WebM) goes through an ffmpeg child process and becomes 16 kHz mono.
   - The language can be an ISO code, a BCP-47 tag (`pt-BR`) or a full name (`English`). No language means `auto`.
   - Each engine gets only the fields that it takes (`fields` in the config). A documented OpenAI field never gives a 400.
   - An unknown model gives 404 with the list of model ids. An upload above the limit gives 413.
-  - `response_format`: `json`, `text`, `verbose_json`. `stream=true` gives one SSE delta and one done event.
-- Two engine adapters. Each engine is a child process in its own process group.
+  - `response_format`: `json`, `text`, `verbose_json`, `srt`, `vtt`. `stream=true` gives one SSE delta and one done event.
+- Three engine adapters. Each engine is a child process in its own process group.
   - `speech-worker`: speech.cpp `speech worker` (JSON Lines protocol 4). Tested with Qwen3-ASR-1.7B Q8_0.
   - `jsonl`: one JSON line for each request and each answer. The FluidAudio runner (Parakeet TDT 0.6B v3) is in `runners/fluidaudio`.
-- A scheduler. One task owns all state. It has a queue for each model, ordered by (class, arrival). A batch job that waits long moves up one class. Each engine runs one request at a time. A full queue gives 503 with `Retry-After`. A job leaves the queue when its client disconnects.
-- Preemption: a voice or interactive job cancels a running batch job on the same engine. The batch job goes back to the front of its class and starts again from the beginning. The hub never cuts audio.
+  - `http-align`: the hub starts a child with an HTTP server (the forced aligner of subtitle-align) on `127.0.0.1` and a private port. It waits for `GET /health`, sends `POST /align` and stops the process group (SIGTERM, then SIGKILL).
+- Word times and subtitles. The virtual model `qwen3-asr+align` (listed in `/v1/models`) works in phases. Phase 1: the hub cuts the audio into windows of at most 30 s at the quietest 200 ms (20 ms RMS frames, inside 20 to 30 s of the window) and transcribes each window. Phase 2: the planner swaps the STT engine for the aligner. The hub aligns each window. The hub adds the window starts and returns `words[]`, `segments[]`, SRT or VTT. The same chain runs for an engine with `word_timestamps_via` when the request has `timestamp_granularities[]=word` or an `srt` or `vtt` format. A request needs at most 2 engine swaps.
+- A Wyoming STT server (Home Assistant). Each `[[wyoming]]` port serves one model with class 0. It answers `describe` with `info`, accepts `pt` and `pt-BR`, and resamples audio that is not 16 kHz mono 16-bit with ffmpeg.
+- A scheduler. One task owns all state. It has a queue for each model, ordered by (class, arrival). A batch job that waits long moves up one class (the jobs of a pipeline do not age). Each engine runs one request at a time. A full queue gives 503 with `Retry-After`. A job leaves the queue when its client disconnects. A job that runs longer than `run_timeout_s` of its class is cancelled (504); an engine that does not stop in 5 s is stopped.
+- Preemption: a voice or interactive job cancels a running batch job on the same engine. The batch job goes back to the front of its class and starts again from the beginning.
 - A memory planner (a pure function with unit tests) and a live gate. The gate reads `host_statistics64` (free + inactive + purgeable), `kern.memorystatus_vm_pressure_level` and the `phys_footprint` of each child (`proc_pid_rusage`). Idle engines stop after `ttl_s`.
+- A guard process. The hub starts itself once with `--guard` and holds a pipe to it. The hub lists the process group of each engine in the pipe. If the hub dies, also from `kill -9`, the kernel closes the pipe and the guard stops all engines (SIGTERM, then SIGKILL after 3 s).
 
 Not built yet:
 
-- `srt` and `vtt` output. The hub answers 400 with "needs timestamps (planned)".
-- The forced aligner engine, word timestamps and the chained `qwen3-asr+align` model (phase M2).
-- A Wyoming listener for Home Assistant, `/v1/audio/alignments`, `/align`, admin routes and a log route.
+- Admin routes, a log route and `GET /v1/models/{id}`.
+- `/v1/audio/alignments` and `/align` take audio of at most 31 s (the limit of the aligner). A longer file gets 400. The hub cannot split the text of a file. Use the pipeline for long audio.
 - The fallback to another model is coded (`fallback`, `allow_fallback`). It was not tested live.
+- A launchd job for the hub (a template is in `contrib/launchd/`).
 
 ## Build
 
@@ -60,7 +64,7 @@ export SSW_KEY_VOICE=... SSW_KEY_APP=... SSW_KEY_BATCH=...   # one long random v
 Each `[[keys]]` entry names an environment variable (`key_env`) or holds the key (`key`). Prefer `key_env`.
 The temporary folder (`tmp_dir`) has mode 0700. The hub removes old `ssw-*` files in it at start and at stop.
 SIGTERM or SIGINT stops the engines and then the hub.
-If the hub dies from SIGKILL, its engines keep running (they have their own process groups). Stop them by hand.
+If the hub dies from SIGKILL, the guard process stops its engines within about 3 s.
 A launchd template is in `contrib/launchd/`.
 
 Test it:
@@ -83,13 +87,19 @@ See [examples/m1.toml](examples/m1.toml). The file is TOML. An unknown key is an
 |---|---|
 | `[server]` | `listen`, `max_upload_mb`, `tmp_dir`, `ffmpeg` (path), `ffmpeg_timeout_s`, `default_model`, `open` |
 | `[[keys]]` | `name`, `key_env` or `key`, `class` (0, 1, 2), `allow_fallback` |
-| `[scheduler]` | `class_timeout_s`, `class_max_queue`, `batch_if_audio_longer_s`, `aging_after_s`, `preempt` |
+| `[scheduler]` | `class_timeout_s`, `class_max_queue`, `run_timeout_s` (the longest run of one job for each class, 0 = none), `batch_if_audio_longer_s`, `aging_after_s`, `preempt` |
 | `[memory]` | `engine_budget_mb`, `headroom_mb`, `min_resident_s`, `evict_on_pressure`, `refuse_loads_on` |
 | `[languages]` | `extra`: more language names |
-| `[[engines]]` | `id`, `aliases`, `adapter`, `cmd`, `env`, `cwd`, `cost_mb`, `evict_cost`, `ttl_s`, `persistent`, `fields`, `languages`, `fallback` |
+| `[chunking]` | `window_min_s`, `window_max_s`, `cut_window_ms`, `frame_ms` (the window cutter of the pipelines) |
+| `[[engines]]` | `id`, `aliases`, `adapter`, `cmd`, `env`, `cwd`, `cost_mb`, `evict_cost`, `ttl_s`, `persistent`, `fields`, `languages`, `fallback`, `word_timestamps_via`; for `http-align`: `url`, `health`, `token_file` |
+| `[[pipelines]]` | `id`, `aliases`, `stt`, `align`: a virtual model that chains an STT engine and an aligner |
+| `[[wyoming]]` | `listen`, `model`, `languages`: one Wyoming port for each model |
 
 Rules:
 
+- The aligner child binds the host and port that its `env` gives. For subtitle-align, the `launch.py` needs a patch of 3 lines that reads `SUBTITLE_ALIGN_HOST` and `SUBTITLE_ALIGN_PORT` (the defaults stay `0.0.0.0` and `8131`).
+- A shell with `PYTHONSAFEPATH=1` keeps `launch.py` from importing its own folder. Set `PYTHONSAFEPATH = ""` in the `env` of the engine.
+- Keys for `/align`: the route takes a hub key in `Authorization: Bearer` or `x-api-key`, like all routes. To keep an old subtitle client unchanged, add a `[[keys]]` entry whose key equals the token that the client sends. Only the URL changes. The hub sends its own token (`token_file`) to the aligner child.
 - A client can lower its class with the header `X-Priority: batch`. It cannot raise it. Audio longer than `batch_if_audio_longer_s` is always batch.
 - A batch job that waits longer than `aging_after_s` moves up to class 1.
 - The planner uses `max(cost_mb, highest footprint seen)` for each engine. The sum of the costs of the resident engines stays at or below `engine_budget_mb`.

@@ -438,8 +438,12 @@ impl Scheduler {
         }));
     }
 
-    fn views(&self, now: Instant) -> Vec<EngineView> {
-        let min_resident = Duration::from_secs(self.cfg.memory.min_resident_s);
+    /// `urgent`: a voice or interactive job waits for the engine. The minimum
+    /// resident time does not hold back an idle engine then. A flow of urgent
+    /// jobs cannot cause a swap loop, because the engine must also have an
+    /// empty queue.
+    fn views(&self, now: Instant, urgent: bool) -> Vec<EngineView> {
+        let min_resident = if urgent { Duration::ZERO } else { Duration::from_secs(self.cfg.memory.min_resident_s) };
         (0..self.slots.len())
             .map(|i| {
                 let (slot, cfg) = (&self.slots[i], &self.cfg.engines[i]);
@@ -508,7 +512,7 @@ impl Scheduler {
                     }
                 }
                 Res::Loading | Res::Stopping => {}
-                Res::Unloaded => match planner::plan(idx, &self.views(now), &self.mem()) {
+                Res::Unloaded => match planner::plan(idx, &self.views(now, head_class <= 1), &self.mem()) {
                     Plan::Load => self.load_engine(idx),
                     Plan::Evict(victims) => {
                         for victim in victims {

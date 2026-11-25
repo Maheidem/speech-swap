@@ -68,8 +68,9 @@ A script read the values every 0.5 s.
 | Idle, after start | 993 KB | 1009 KB | 1712 KB | 1025 KB | 1 |
 | During 1 upload of 30 MB (3 MB/s, 9.6 s) | 1681 KB | 1697 KB | 2416 KB | 1713 KB | 2 |
 | End of that upload | 2673 KB | 2689 KB | 3408 KB | not read | 2 |
-| During 20 parallel uploads of 30 MB (2 MB/s each, 14.4 s) | 12 MB | 12 MB | 12752 KB | 11.6 MB | 11 |
-| Idle, 45 s after the 20 uploads | 12,157,888 B | 12,174,272 B | 12592 KB | not read | 1 |
+| During 20 parallel uploads of 30 MB (2 MB/s each, 14.4 s) | 12 MB | not read | 12752 KB | not read | 11 |
+| About 10 s after the 20 uploads | 12 MB | 12 MB | 12752 KB | 11.6 MB | 11 |
+| Idle, about 45 s after the 20 uploads | 12,157,888 B | 12,174,272 B | 12592 KB | not read | 1 |
 
 `/usr/bin/time -l` for the full run (idle, 1 upload, 20 parallel uploads; 108 s):
 

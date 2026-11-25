@@ -1,0 +1,28 @@
+[package]
+name = "speech-swap"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Tiny Rust hub that unifies local speech engines behind one OpenAI-style API"
+repository = "https://github.com/Maheidem/speech-swap"
+
+# M0 has one binary: the footprint probe. The hub itself does not exist yet.
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+bytes = "1"
+futures-util = { version = "0.3", default-features = false }
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+multer = { version = "3", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "fs", "io-util"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

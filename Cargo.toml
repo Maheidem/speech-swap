@@ -1,12 +1,17 @@
 [package]
 name = "speech-swap"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Tiny Rust hub that unifies local speech engines behind one OpenAI-style API"
 repository = "https://github.com/Maheidem/speech-swap"
 
-# M0 has one binary: the footprint probe. The hub itself does not exist yet.
+# The hub.
+[[bin]]
+name = "speech-swap"
+path = "src/main.rs"
+
+# The M0 footprint probe. It stays as the reference for the M0 numbers.
 [[bin]]
 name = "probe"
 path = "src/bin/probe.rs"
@@ -17,8 +22,12 @@ futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+libc = "0.2"
 multer = { version = "3", default-features = false }
-tokio = { version = "1", default-features = false, features = ["rt", "net", "fs", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "fs", "io-util", "process", "sync", "time", "signal", "macros"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [profile.release]
 opt-level = "z"

@@ -1,0 +1,66 @@
+# Example config for an 8 GB Apple Silicon Mac (M1 Air).
+# Keys come from environment variables. No key is in this file.
+# Replace /Users/YOU with your home folder, or use "~/" at the start of a path.
+
+[server]
+listen        = "0.0.0.0:8780"
+max_upload_mb = 100
+tmp_dir       = "~/.cache/speech-swap/tmp"
+ffmpeg        = "/opt/homebrew/bin/ffmpeg"
+default_model = "Qwen3-ASR-1.7B"
+# open = true     # no keys needed; for tests only
+
+[[keys]]
+name    = "voice"
+key_env = "SSW_KEY_VOICE"
+class   = 0
+allow_fallback = true
+
+[[keys]]
+name    = "app"
+key_env = "SSW_KEY_APP"
+class   = 1
+
+[[keys]]
+name    = "batch"
+key_env = "SSW_KEY_BATCH"
+class   = 2
+
+[scheduler]
+class_timeout_s = [15, 120, 1800]
+class_max_queue = [8, 32, 256]
+batch_if_audio_longer_s = 60
+aging_after_s = 120
+preempt = true
+
+[memory]
+engine_budget_mb = 5200
+headroom_mb      = 400
+min_resident_s   = 20
+
+[languages]
+# More names for languages, added to the built-in list.
+extra = { "brazilian portuguese" = "pt" }
+
+[[engines]]
+id      = "Qwen3-ASR-1.7B"
+aliases = ["qwen3-asr", "whisper-1"]
+adapter = "speech-worker"
+cmd     = ["~/stt-lab/bin/speechcpp/speech", "worker", "qwen3-asr-1.7b"]
+env     = { SPEECH_NO_UPDATE_CHECK = "1", SPEECH_MODEL_DIR = "~/stt-lab/models/speechcpp" }
+ready_timeout_s = 60
+cost_mb    = 2500
+evict_cost = 5
+ttl_s      = 0
+fields     = ["language", "prompt"]
+fallback   = "parakeet-tdt-0.6b-v3"
+
+[[engines]]
+id      = "parakeet-tdt-0.6b-v3"
+aliases = ["parakeet"]
+adapter = "jsonl"
+cmd     = ["~/stt-lab/runners/bin/fluidaudio-runner"]
+ready_timeout_s = 60
+cost_mb    = 300
+persistent = true
+fields     = []

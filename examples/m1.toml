@@ -28,6 +28,7 @@ class   = 2
 
 [scheduler]
 class_timeout_s = [15, 120, 1800]
+run_timeout_s   = [30, 300, 3600]    # the longest run of one job in an engine; 0 = no limit
 class_max_queue = [8, 32, 256]
 batch_if_audio_longer_s = 60
 aging_after_s = 120
@@ -54,6 +55,8 @@ evict_cost = 5
 ttl_s      = 0
 fields     = ["language", "prompt"]
 fallback   = "parakeet-tdt-0.6b-v3"
+# Word times and SRT/VTT for this engine come from this aligner (a pipeline).
+word_timestamps_via = "Qwen3-ForcedAligner-0.6B"
 
 [[engines]]
 id      = "parakeet-tdt-0.6b-v3"
@@ -64,3 +67,44 @@ ready_timeout_s = 60
 cost_mb    = 300
 persistent = true
 fields     = []
+
+# The forced aligner is a child process with its own HTTP server. The hub starts
+# it on the loopback address and a private port, and stops it after 120 s idle.
+# The Qwen engine (2500 MB) and the aligner (3400 MB) never fit together in the
+# 5200 MB budget, so the hub swaps them.
+[[engines]]
+id      = "Qwen3-ForcedAligner-0.6B"
+adapter = "http-align"
+cmd     = ["~/subtitle-align/.venv/bin/python", "~/subtitle-align/launch.py"]
+cwd     = "~/subtitle-align"
+env     = { SUBTITLE_ALIGN_HOST = "127.0.0.1", SUBTITLE_ALIGN_PORT = "18131" }
+url     = "http://127.0.0.1:18131"
+health  = "/health"
+token_file = "~/subtitle-align/token"   # the Bearer token of the child; the hub never logs it
+ready_timeout_s = 90
+cost_mb    = 3400
+evict_cost = 1
+ttl_s      = 120
+fields     = ["language"]
+
+# A virtual model: window the audio, transcribe each window, swap the engines,
+# align each window, merge the times. It is listed in /v1/models.
+[[pipelines]]
+id    = "qwen3-asr+align"
+stt   = "Qwen3-ASR-1.7B"
+align = "Qwen3-ForcedAligner-0.6B"
+
+[chunking]
+window_min_s  = 20
+window_max_s  = 30
+cut_window_ms = 200
+frame_ms      = 20
+
+# Wyoming STT for Home Assistant. Each port serves one model. Class 0.
+[[wyoming]]
+listen = "0.0.0.0:10300"
+model  = "parakeet-tdt-0.6b-v3"
+languages = ["pt", "pt-BR", "en"]
+[[wyoming]]
+listen = "0.0.0.0:10301"
+model  = "Qwen3-ASR-1.7B"

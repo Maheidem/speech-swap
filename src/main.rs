@@ -11,11 +11,14 @@ macro_rules! log {
 
 mod config;
 mod engine;
+mod guard;
 mod http;
 mod macos;
 mod normalize;
+mod pipeline;
 mod planner;
 mod sched;
+mod wyoming;
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -43,6 +46,10 @@ fn prepare_tmp(cfg: &Config) -> std::io::Result<()> {
 }
 
 fn main() {
+    // The guard process: it stops the engines if the hub dies (see guard.rs).
+    if std::env::args().nth(1).as_deref() == Some("--guard") {
+        std::process::exit(guard::run());
+    }
     let Some(path) = std::env::args().nth(1).filter(|a| !a.starts_with('-')) else {
         eprintln!("usage: speech-swap CONFIG.toml");
         std::process::exit(2);
@@ -75,8 +82,21 @@ async fn run(cfg: Arc<Config>) -> i32 {
         (Ok(a), Ok(b)) => (a, b),
         _ => return 1,
     };
+    guard::start();
     let tx = sched::start(cfg.clone());
     let state = Arc::new(http::State::new(cfg.clone(), tx.clone()));
+    for w in &cfg.wyoming {
+        match TcpListener::bind(&w.listen).await {
+            Ok(l) => {
+                log!("wyoming: model {} listens on {}", w.model, w.listen);
+                tokio::spawn(wyoming::serve(state.clone(), l, w.clone()));
+            }
+            Err(e) => {
+                eprintln!("cannot listen on {} (wyoming): {e}", w.listen);
+                return 1;
+            }
+        }
+    }
     log!(
         "speech-swap {} listens on {} (pid {}, {} engines, auth {})",
         env!("CARGO_PKG_VERSION"),

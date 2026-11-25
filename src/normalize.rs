@@ -82,6 +82,39 @@ pub fn language(raw: Option<&str>, extra: &HashMap<String, String>) -> Option<St
     None
 }
 
+/// Decodes standard base64. Line breaks and spaces are skipped. `None` means
+/// the text is not valid base64.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let (mut acc, mut bits, mut pad) = (0u32, 0u32, 0usize);
+    for c in input.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                pad += 1;
+                continue;
+            }
+            b'\n' | b'\r' | b' ' => continue,
+            _ => return None,
+        };
+        if pad > 0 {
+            return None;
+        }
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    (pad <= 2).then_some(out)
+}
+
 /// The position of the samples in a WAV file.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WavData {
@@ -150,6 +183,37 @@ pub async fn transcode(ffmpeg: &str, input: &Path, output: &Path, timeout: Durat
     }
 }
 
+/// Converts raw PCM (any rate, width 1, 2 or 4 bytes, any channel count) to
+/// 16 kHz mono 16-bit WAV with an ffmpeg child.
+pub async fn transcode_raw(ffmpeg: &str, input: &Path, output: &Path, rate: u32, width: u32, channels: u32, timeout: Duration) -> Result<(), String> {
+    let format = match width {
+        1 => "u8",
+        2 => "s16le",
+        4 => "s32le",
+        _ => return Err(format!("sample width {width} is not supported")),
+    };
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", format, "-ar"])
+        .arg(rate.to_string())
+        .arg("-ac")
+        .arg(channels.to_string())
+        .arg("-i")
+        .arg(input)
+        .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav"])
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().map_err(|e| format!("ffmpeg did not start: {e}"))?;
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Err(_) => Err(format!("ffmpeg did not finish in {} s", timeout.as_secs())),
+        Ok(Err(e)) => Err(format!("ffmpeg failed: {e}")),
+        Ok(Ok(out)) if out.status.success() => Ok(()),
+        Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("no output").chars().take(200).collect()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +252,15 @@ mod tests {
         assert_eq!(language(None, &HashMap::new()), None);
         assert_eq!(lang("Klingon"), None);
         assert_eq!(lang("12"), None);
+    }
+
+    #[test]
+    fn base64_decodes_known_values() {
+        for (text, expect) in [("", ""), ("Zg==", "f"), ("Zm8=", "fo"), ("Zm9v", "foo"), ("Zm9vYmFy", "foobar"), ("Zm9v\nYmFy", "foobar")] {
+            assert_eq!(base64_decode(text).unwrap(), expect.as_bytes());
+        }
+        assert!(base64_decode("Zm9v!").is_none());
+        assert!(base64_decode("Zg==Zg").is_none());
     }
 
     #[test]

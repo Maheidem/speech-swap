@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::config::Config;
+use crate::config::{Adapter, Config};
 use crate::engine::{self, Cmd, Event, Fail, Output, Run};
 use crate::macos;
 use crate::planner::{self, EngineView, Mem, Plan, Res};
@@ -28,6 +28,9 @@ pub struct Job {
     pub class: u8,
     pub key: String,
     pub allow_fallback: bool,
+    /// `false` for the jobs of a pipeline: they do not rise to class 1.
+    /// A long file has many windows, and all of them would rise at once.
+    pub aging: bool,
     pub run: Run,
     pub reply: oneshot::Sender<Result<Done, Reject>>,
 }
@@ -81,6 +84,8 @@ struct Running {
     preempting: bool,
     /// The client is gone. The answer of the engine has no reader.
     abandoned: bool,
+    /// The run-time limit passed at this time. The hub sent `cancel`.
+    timed_out: Option<Instant>,
 }
 
 struct Slot {
@@ -243,7 +248,7 @@ impl Scheduler {
         let aging = self.cfg.scheduler.aging_after_s;
         self.cfg.scheduler.preempt
             && !running.abandoned
-            && effective_class(running.q.job.class, now - running.q.arrival, aging) == 2
+            && effective_class(running.q.job.class, now - running.q.arrival, if running.q.job.aging { aging } else { 0 }) == 2
     }
 
     // ---------------------------------------------------------------- jobs
@@ -350,10 +355,22 @@ impl Scheduler {
     }
 
     fn job_done(&mut self, idx: usize, running: Running, result: Result<Output, Fail>, now: Instant) {
-        let Running { q, started, preempting, abandoned } = running;
+        let Running { q, started, preempting, abandoned, timed_out } = running;
         let class = q.job.class as usize;
         let run_s = (now - started).as_secs_f64();
         if abandoned {
+            return;
+        }
+        // The hub cancelled or stopped this job for the run-time limit.
+        if let (Some(_), Err(_)) = (timed_out, &result) {
+            let limit = self.cfg.scheduler.run_timeout_s[class];
+            log!("job {} ran longer than {limit} s on {}; it is cancelled", q.job.id, self.id(idx));
+            let _ = q.job.reply.send(Err(Reject {
+                status: 504,
+                code: "run_timeout",
+                message: format!("the engine did not finish in {limit} s"),
+                retry_after: None,
+            }));
             return;
         }
         match result {
@@ -457,7 +474,7 @@ impl Scheduler {
         // Serve the engine with the best waiting job first.
         let mut order: Vec<(u8, u64, usize)> = Vec::new();
         for (idx, slot) in self.slots.iter().enumerate() {
-            let keys = slot.queue.iter().map(|q| (effective_class(q.job.class, now - q.arrival, aging), q.job.id));
+            let keys = slot.queue.iter().map(|q| (effective_class(q.job.class, now - q.arrival, if q.job.aging { aging } else { 0 }), q.job.id));
             if let Some(best) = keys.min() {
                 order.push((best.0, best.1, idx));
             }
@@ -472,7 +489,7 @@ impl Scheduler {
                     let sent = slot.cmd.as_ref().is_some_and(|cmd| cmd.send(Cmd::Run(q.job.run.clone())).is_ok());
                     if sent {
                         slot.res = Res::Busy;
-                        slot.running = Some(Running { q, started: now, preempting: false, abandoned: false });
+                        slot.running = Some(Running { q, started: now, preempting: false, abandoned: false, timed_out: None });
                     } else {
                         slot.queue.push(q); // The task is gone. Its exit event comes next.
                     }
@@ -541,6 +558,27 @@ impl Scheduler {
                 } else {
                     i += 1;
                 }
+            }
+        }
+        // Run-time limit: cancel the job. An engine that does not stop in 5 s is stopped.
+        for idx in 0..self.slots.len() {
+            let limits = self.cfg.scheduler.run_timeout_s;
+            let slot = &mut self.slots[idx];
+            let Some(running) = slot.running.as_mut() else { continue };
+            let limit = limits[running.q.job.class as usize];
+            match running.timed_out {
+                None if limit > 0 && (now - running.started).as_secs() >= limit => {
+                    running.timed_out = Some(now);
+                    log!("job {} passed the run-time limit of {limit} s on {}; cancel sent", running.q.job.id, self.cfg.engines[idx].id);
+                    if let Some(cmd) = &slot.cmd {
+                        let _ = cmd.send(Cmd::Cancel);
+                    }
+                }
+                Some(since) if (now - since).as_secs() >= 5 && slot.res == Res::Busy => {
+                    log!("engine {} does not stop after the cancel; the hub stops it", self.cfg.engines[idx].id);
+                    self.stop_engine(idx);
+                }
+                _ => {}
             }
         }
         // Idle stop (TTL).
@@ -649,21 +687,31 @@ impl Scheduler {
     }
 
     fn models_json(&self) -> String {
-        let data: Vec<_> = (0..self.slots.len())
+        let mut data: Vec<_> = (0..self.slots.len())
             .map(|i| {
+                let cfg = &self.cfg.engines[i];
                 json!({
                     "id": self.id(i),
                     "object": "model",
                     "created": 0,
                     "owned_by": "speech-swap",
                     "speech_swap": {
-                        "kind": "stt",
-                        "aliases": self.cfg.engines[i].aliases,
+                        "kind": if cfg.adapter == Adapter::HttpAlign { "aligner" } else { "stt" },
+                        "aliases": cfg.aliases,
                         "resident": self.slots[i].res != Res::Unloaded,
                     },
                 })
             })
             .collect();
+        data.extend(self.cfg.pipelines.iter().map(|p| {
+            json!({
+                "id": p.id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "speech-swap",
+                "speech_swap": {"kind": "pipeline", "aliases": p.aliases, "steps": [p.stt, p.align], "resident": false},
+            })
+        }));
         json!({"object": "list", "data": data}).to_string()
     }
 

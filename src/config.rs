@@ -17,7 +17,15 @@ pub struct Config {
     pub memory: Memory,
     #[serde(default)]
     pub languages: Languages,
+    #[serde(default)]
+    pub chunking: Chunking,
     pub engines: Vec<Engine>,
+    /// Virtual models: a chain of an STT engine and an aligner.
+    #[serde(default)]
+    pub pipelines: Vec<Pipeline>,
+    /// Wyoming STT listeners, one model for each port.
+    #[serde(default)]
+    pub wyoming: Vec<Wyoming>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -78,6 +86,9 @@ pub struct Scheduler {
     /// A class-0 or class-1 job cancels a running batch job on the same engine.
     pub preempt: bool,
     pub retry_after_s: u32,
+    /// The longest run time of one job in the engine, for each class. 0 = no limit.
+    /// After it, the hub cancels the job. If the engine does not stop, the hub stops it.
+    pub run_timeout_s: [u64; 3],
 }
 
 impl Default for Scheduler {
@@ -89,6 +100,7 @@ impl Default for Scheduler {
             aging_after_s: 120,
             preempt: true,
             retry_after_s: 5,
+            run_timeout_s: [30, 300, 3600],
         }
     }
 }
@@ -127,6 +139,48 @@ pub struct Languages {
     pub extra: HashMap<String, String>,
 }
 
+/// How the hub cuts long audio for the pipelines (the RMS window cutter).
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields, default)]
+pub struct Chunking {
+    /// A window is at most this long. The aligner takes at most 31 s.
+    pub window_max_s: f64,
+    /// The cut falls at or after this time in the window.
+    pub window_min_s: f64,
+    /// The cut falls in the quietest span of this length.
+    pub cut_window_ms: u64,
+    /// The length of one frame of the energy curve.
+    pub frame_ms: u64,
+}
+
+impl Default for Chunking {
+    fn default() -> Self {
+        Chunking { window_max_s: 30.0, window_min_s: 20.0, cut_window_ms: 200, frame_ms: 20 }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Pipeline {
+    pub id: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// The STT engine of phase 1.
+    pub stt: String,
+    /// The aligner engine of phase 2.
+    pub align: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Wyoming {
+    pub listen: String,
+    /// The id of the STT engine for this port.
+    pub model: String,
+    #[serde(default = "d_wy_languages")]
+    pub languages: Vec<String>,
+}
+
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
 pub enum Adapter {
     /// speech.cpp `speech worker`, JSON Lines protocol 4.
@@ -135,6 +189,10 @@ pub enum Adapter {
     /// One JSON line for each request and each answer (see `runners/`).
     #[serde(rename = "jsonl")]
     Jsonl,
+    /// A child process with an HTTP server on a private port: the subtitle-align
+    /// forced aligner (`POST /align`).
+    #[serde(rename = "http-align")]
+    HttpAlign,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -169,6 +227,17 @@ pub struct Engine {
     pub languages: Vec<String>,
     /// The model that takes a class-0 job when this engine cannot start it at once.
     pub fallback: Option<String>,
+    /// The aligner that gives word times for this engine (the pipeline model).
+    pub word_timestamps_via: Option<String>,
+    /// `http-align`: the base URL of the child, for example `http://127.0.0.1:18131`.
+    pub url: Option<String>,
+    /// `http-align`: the path that answers 200 when the child is ready.
+    #[serde(default = "d_health")]
+    pub health: String,
+    /// `http-align`: a file with the Bearer token of the child. The hub never logs it.
+    pub token_file: Option<String>,
+    #[serde(skip)]
+    pub token: String,
 }
 
 fn d_100() -> u64 {
@@ -189,8 +258,21 @@ fn d_1u8() -> u8 {
 fn d_1u32() -> u32 {
     1
 }
+fn d_health() -> String {
+    "/health".into()
+}
+fn d_wy_languages() -> Vec<String> {
+    vec!["pt".into(), "pt-BR".into(), "en".into()]
+}
 fn d_ffmpeg() -> String {
     "ffmpeg".into()
+}
+
+/// What a model name means.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Route {
+    Engine(usize),
+    Pipeline { stt: usize, align: usize, id: String },
 }
 
 /// Changes a leading `~/` into the home folder of the user.
@@ -224,6 +306,22 @@ impl Config {
             }
             e.cwd = e.cwd.as_deref().map(expand_home);
         }
+        for e in &mut cfg.engines {
+            if e.adapter == Adapter::HttpAlign {
+                let Some(url) = &e.url else { return Err(format!("engine {}: http-align needs `url`", e.id)) };
+                let Some(rest) = url.strip_prefix("http://") else {
+                    return Err(format!("engine {}: `url` must start with http://", e.id));
+                };
+                if rest.trim_end_matches('/').contains('/') {
+                    return Err(format!("engine {}: `url` has no path; use `health` for a path", e.id));
+                }
+            }
+            if let Some(file) = &e.token_file {
+                let path = expand_home(file);
+                let text = std::fs::read_to_string(&path).map_err(|err| format!("engine {}: token_file {path}: {err}", e.id))?;
+                e.token = text.trim().to_string();
+            }
+        }
         for (i, e) in cfg.engines.iter().enumerate() {
             let mut names = vec![&e.id];
             names.extend(e.aliases.iter());
@@ -240,10 +338,47 @@ impl Config {
                 }
             }
         }
+        for (i, p) in cfg.pipelines.iter().enumerate() {
+            let clash = |name: &str| {
+                cfg.engine_index(name).is_some()
+                    || cfg.pipelines.iter().enumerate().any(|(j, o)| j != i && (o.id.eq_ignore_ascii_case(name) || o.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))))
+            };
+            for name in std::iter::once(&p.id).chain(p.aliases.iter()) {
+                if clash(name) {
+                    return Err(format!("the model name {name} is in two models"));
+                }
+            }
+            match cfg.engine_index(&p.stt) {
+                Some(i) if cfg.engines[i].adapter != Adapter::HttpAlign => {}
+                _ => return Err(format!("pipeline {}: stt {} is not an STT engine", p.id, p.stt)),
+            }
+            match cfg.engine_index(&p.align) {
+                Some(i) if cfg.engines[i].adapter == Adapter::HttpAlign => {}
+                _ => return Err(format!("pipeline {}: align {} is not an aligner engine", p.id, p.align)),
+            }
+        }
+        for e in &cfg.engines {
+            if let Some(via) = &e.word_timestamps_via {
+                match cfg.engine_index(via) {
+                    Some(i) if cfg.engines[i].adapter == Adapter::HttpAlign && e.adapter != Adapter::HttpAlign => {}
+                    _ => return Err(format!("engine {}: word_timestamps_via {via} is not an aligner engine", e.id)),
+                }
+            }
+        }
+        for w in &cfg.wyoming {
+            match cfg.engine_index(&w.model) {
+                Some(i) if cfg.engines[i].adapter != Adapter::HttpAlign => {}
+                _ => return Err(format!("wyoming {}: model {} is not an STT engine", w.listen, w.model)),
+            }
+        }
         if let Some(model) = &cfg.server.default_model {
-            if cfg.engine_index(model).is_none() {
+            if cfg.resolve(model).is_none() {
                 return Err(format!("server.default_model {model} is not a model"));
             }
+        }
+        let c = &cfg.chunking;
+        if !(c.window_min_s > 1.0 && c.window_min_s < c.window_max_s && c.window_max_s <= 31.0 && c.frame_ms > 0 && c.cut_window_ms >= c.frame_ms) {
+            return Err("chunking: need 1 < window_min_s < window_max_s <= 31 and cut_window_ms >= frame_ms > 0".into());
         }
         for k in &mut cfg.keys {
             if k.class > 2 {
@@ -277,8 +412,32 @@ impl Config {
         })
     }
 
+    pub fn pipeline_index(&self, model: &str) -> Option<usize> {
+        self.pipelines.iter().position(|p| {
+            p.id.eq_ignore_ascii_case(model) || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(model))
+        })
+    }
+
+    /// Finds a model: an engine or a pipeline.
+    pub fn resolve(&self, model: &str) -> Option<Route> {
+        if let Some(i) = self.engine_index(model) {
+            return Some(Route::Engine(i));
+        }
+        self.pipeline_index(model).map(|i| Route::Pipeline {
+            stt: self.engine_index(&self.pipelines[i].stt).expect("checked at start"),
+            align: self.engine_index(&self.pipelines[i].align).expect("checked at start"),
+            id: self.pipelines[i].id.clone(),
+        })
+    }
+
+    /// The pipeline of an engine that has `word_timestamps_via`: STT engine and aligner.
+    pub fn implicit_pipeline(&self, engine: usize) -> Option<(usize, usize)> {
+        let via = self.engines[engine].word_timestamps_via.as_deref()?;
+        Some((engine, self.engine_index(via)?))
+    }
+
     pub fn model_ids(&self) -> Vec<&str> {
-        self.engines.iter().map(|e| e.id.as_str()).collect()
+        self.engines.iter().map(|e| e.id.as_str()).chain(self.pipelines.iter().map(|p| p.id.as_str())).collect()
     }
 
     pub fn tmp_dir(&self) -> PathBuf {

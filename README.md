@@ -118,6 +118,19 @@ Engines: Qwen3-ASR-1.7B Q8_0 (`speech worker`, speech.cpp 0.11.2) and Parakeet T
 - **Hub memory** (`footprint`, phys_footprint). 1.2 MB at start with no engine. 1.8 MB with both engines loaded. 4.4 MB at the peak during the load (a 9.6 MB upload). 2.1 MB after the load. Swap did not change (168 MB before and after). The hub writes the upload with synchronous writes, not `tokio::fs`. The M0 test with 20 parallel uploads (12 MB idle afterwards) was not repeated.
 - **Memory planner, live.** With a budget of 2600 MB, Qwen (2500 MB) and Parakeet (300 MB) never ran together. A request for the other model stopped the idle one first. The swap took 5.5 s and 7.1 s, including the 5 s minimum resident time.
 
+## Measured on the M1 for M2 (2026-11-25)
+
+Same host. The hub had 3 engines: the Qwen worker, the Parakeet runner and the aligner child.
+
+- **Alignment equal to the direct aligner.** Three cases (2 HA clips, 25 s of a long file), `/align` and `/v1/audio/alignments`: same words, 0.0 ms difference. The direct aligner ran after the hub, in sequence.
+- **Pipeline `qwen3-asr+align`.** A file of 180 s: 7 windows, 403 words, 38 s, 1 swap (2 when the aligner was resident). A file of 300 s: 764 words in 61.6 s. WER on a 164 s Portuguese file and a 134 s English file with an exact reference: 0.0533 and 0.0774 with windows, 0.0533 and 0.0943 for the whole file. `vm.swapusage` did not change.
+- **Wyoming.** 20 HA clips on each port: all texts equal to the texts of the HTTP test. Parakeet p50 0.072 s, p90 0.322 s. Qwen p50 0.466 s, p90 0.927 s.
+- **Priority.** Parakeet clips every 10 s during a 300 s pipeline: 7 clips, p50 0.139 s, max 0.146 s. A class-1 Qwen request during the align phase waits for the end of that phase (10 to 14 s).
+- **`kill -9` of the hub.** No engine process left after 0.6 s. The next start removes the temporary files.
+- **Hub memory.** 1.2 MB idle, 9.6 MiB at the peak of a pipeline request, 5.2 MB after. The binary has 1,006,192 bytes.
+
+For a pipeline, the headers `x-speech-swap-wait-ms` and `x-speech-swap-run-ms` are sums over the window jobs.
+
 The M0 probe numbers (the HTTP layer alone) follow.
 
 ## The M0 probe

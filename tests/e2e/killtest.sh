@@ -22,7 +22,11 @@ PAT='speech worker|fluidaudio-runner|launch.py|speech-swap --guard'
 fail=0
 
 hub_pid() { pgrep -x speech-swap | head -1; }
-engines() { pgrep -fl "$PAT" | grep -v pgrep; }
+# Engine processes of other owners (for example a launchd service with the same program) are not the hub's.
+# The script lists them before it starts the hub and leaves them out of every later list.
+pkill -TERM -x speech-swap 2>/dev/null; sleep 3
+BASE=" $(pgrep -f "$PAT" | tr '\n' ' ')"
+engines() { pgrep -fl "$PAT" | grep -v pgrep | while read -r pid rest; do case "$BASE" in *" $pid "*) ;; *) echo "$pid $rest" ;; esac; done; }
 
 start_hub() { $START >/dev/null; for i in $(seq 1 20); do curl -s -m 2 -o /dev/null "$HUB/health" && return 0; sleep 0.5; done; echo "the hub did not start"; exit 1; }
 

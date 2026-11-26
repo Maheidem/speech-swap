@@ -58,6 +58,8 @@ pub enum Query {
     Metrics,
     Health,
     Models,
+    /// The status body of the legacy aligner API (`GET /status`).
+    AlignStatus,
 }
 
 pub enum Msg {
@@ -228,6 +230,7 @@ impl Scheduler {
                     Query::Metrics => self.metrics_text(),
                     Query::Health => self.health_json(),
                     Query::Models => self.models_json(),
+                    Query::AlignStatus => self.align_status_json(),
                 });
             }
             Msg::Shutdown(_) => {}
@@ -688,6 +691,30 @@ impl Scheduler {
         let engines: serde_json::Map<String, serde_json::Value> =
             (0..self.slots.len()).map(|i| (self.id(i).to_string(), json!(Self::res_name(self.slots[i].res)))).collect();
         json!({"status": "ok", "engines": engines}).to_string()
+    }
+
+    /// The shape that the subtitle-align server gives on `GET /status`.
+    /// Clients of that server use `uptime_s` as their health check.
+    fn align_status_json(&self) -> String {
+        let idx = (0..self.slots.len()).find(|&i| self.cfg.engines[i].adapter == Adapter::HttpAlign);
+        let id = idx.map(|i| self.id(i).to_string());
+        let (mut requests, mut errors) = (0u64, 0u64);
+        for ((model, _, _, code), n) in &self.counters.requests {
+            if Some(model) == id.as_ref() {
+                requests += *n;
+                if *code >= 400 {
+                    errors += *n;
+                }
+            }
+        }
+        json!({
+            "uptime_s": self.started.elapsed().as_secs(),
+            "model_loaded": idx.is_some_and(|i| self.slots[i].res != Res::Unloaded),
+            "requests": requests,
+            "errors": errors,
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+        .to_string()
     }
 
     fn models_json(&self) -> String {

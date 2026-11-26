@@ -142,6 +142,14 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Resp, Infall
                 resp
             }
         },
+        // Legacy aligner API: its clients read `uptime_s` here as a health check.
+        (&Method::GET, "/status") => match authenticate(&state.cfg, req.headers()) {
+            Err(resp) => legacy_error(resp.status().as_u16(), "unauthorized"),
+            Ok(_) => match ask(&state, Query::AlignStatus).await {
+                Some(body) => reply(200, "application/json", body),
+                None => legacy_error(503, "scheduler_stuck"),
+            },
+        },
         (&Method::POST, "/v1/audio/alignments" | "/align") => {
             let legacy = path == "/align";
             match authenticate(&state.cfg, req.headers()) {
